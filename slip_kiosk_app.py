@@ -1,7 +1,7 @@
 """Slip Kiosk - prints an attendance + leave slip for every punch. Needs slip_bridge.py next to it.
 Reports: copy the WH / LB files exactly as downloaded (.xls, .xlsx or .csv; the name only has to contain WH or LB) into the 'reports' folder
 (or the linked folder). They are read as they are and are live about 15-30 seconds later - no conversion, no restart."""
-import base64, hashlib, hmac, io, json, os, queue, re, secrets, shutil, sys, threading
+import base64, hashlib, hmac, io, json, os, queue, re, secrets, shutil, sys, threading, time
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
@@ -52,7 +52,7 @@ except Exception:
     pass
 
 cfg = {'device_ip': '192.168.1.201', 'device_port': '4370', 'comm_key': '0', 'printer_ip': '192.168.1.250',
-       'paper': '80', 'days': '30', 'mode': 'network', 'printer_name': '', 'source_dir': '', 'plain': False, 'autorun': False}
+       'paper': '80', 'days': '30', 'mode': 'network', 'printer_name': '', 'source_dir': '', 'plain': False, 'autorun': False, 'preview_only': False}
 if os.path.exists(CFG):
     cfg.update(json.load(open(CFG)))
 cfg.pop('sync_min', None); cfg.pop('auto_salary', None)
@@ -291,8 +291,8 @@ tread.bind('<Configure>', _tread)
 
 # ---- tabs: Dashboard (touch keypad + slip preview) | Connectivity (machine + printer) | Data (WH / LB reports)
 nb = ttk.Notebook(root); nb.pack(fill='both', expand=True, padx=8, pady=(4, 8))
-tab_dash, tab_conn, tab_data = (tk.Frame(nb, bg=BG) for _ in range(3))
-nb.add(tab_dash, text='Dashboard'); nb.add(tab_conn, text='Connectivity'); nb.add(tab_data, text='Data')
+tab_dash, tab_key, tab_conn, tab_data = (tk.Frame(nb, bg=BG) for _ in range(4))
+nb.add(tab_dash, text='Dashboard'); nb.add(tab_key, text='Keypad'); nb.add(tab_conn, text='Connectivity'); nb.add(tab_data, text='Data')
 
 # ---- overview cards
 sv = {k: tk.StringVar(value='-') for k in ('mach', 'mach_state', 'prn', 'wh', 'lb', 'emp', 'sal', 'sync', 'watch', 'slips', 'last')}
@@ -542,11 +542,30 @@ dash_q = queue.Queue()
 entered, pstat, shown = tk.StringVar(), tk.StringVar(), tk.StringVar()
 fresh, cur_slip, cur_sal = [False], [None], [None]       # fresh = next digit starts a new ID; cur_slip / cur_sal = attendance / salary slip text on screen
 printed = {'att': False, 'sal': False}
-tab_dash.columnconfigure(0, weight=2, uniform='d'); tab_dash.columnconfigure(1, weight=3, uniform='d'); tab_dash.columnconfigure(2, weight=3, uniform='d'); tab_dash.rowconfigure(0, weight=1)
-left_o, left = make_card(tab_dash, px=20, py=18)
+tab_dash.columnconfigure(0, weight=1, uniform='d'); tab_dash.columnconfigure(1, weight=1, uniform='d'); tab_dash.rowconfigure(1, weight=1)
+dbar = tk.Frame(tab_dash, bg=BG); dbar.grid(row=0, column=0, columnspan=2, sticky='ew', padx=14, pady=(8, 0))      # ID of the slips on screen + preview-only switch
+dash_id = tk.StringVar()
+tk.Label(dbar, textvariable=dash_id, font=('Segoe UI', 13, 'bold'), fg=NAVY, bg=BG).pack(side='left')
+preview_only = tk.BooleanVar(value=bool(cfg.get('preview_only')))
+
+
+def toggle_preview_only():                            # password protected: a wrong / cancelled password puts the box back
+    want = preview_only.get()
+    if not confirm_exit_password('Password required', 'Enter password to change this setting', 'OK'):
+        preview_only.set(not want); return
+    cfg['preview_only'] = want; sb.PREVIEW_ONLY = want
+    try: json.dump(cfg, open(CFG, 'w'))
+    except OSError: pass
+
+
+ttk.Checkbutton(dbar, text='Preview only: a punch on the machine shows both slips but prints nothing until Print slip is pressed', variable=preview_only,
+                command=toggle_preview_only, style='Card.TCheckbutton').pack(side='right')
+left_o, left = make_card(tab_key, px=20, py=18)
+left.config(width=440); left.pack_propagate(False)                     # keypad tab: one centred keypad panel
+left_o.pack(fill='y', expand=True, pady=10)
 mid_o, mid = make_card(tab_dash, px=14, py=14)
 right_o, right = make_card(tab_dash, px=14, py=14)
-left_o.grid(row=0, column=0, sticky='nsew', padx=(10, 5), pady=8); mid_o.grid(row=0, column=1, sticky='nsew', padx=5, pady=8); right_o.grid(row=0, column=2, sticky='nsew', padx=(5, 10), pady=8)
+mid_o.grid(row=1, column=0, sticky='nsew', padx=(10, 5), pady=8); right_o.grid(row=1, column=1, sticky='nsew', padx=(5, 10), pady=8)
 
 top_l = tk.Frame(left, bg='white'); top_l.pack(fill='x', pady=(0, 10))                     # logo + heading on top of the keypad panel
 try:
@@ -571,6 +590,7 @@ def _show_id(*_):
 
 
 entered.trace_add('write', _show_id); _show_id()
+entered.trace_add('write', lambda *_: dash_id.set(('Employee ID: ' + entered.get()) if entered.get() else ''))
 pad = tk.Frame(left, bg='white', height=520); pad.pack(fill='x'); pad.grid_propagate(False)      # keypad: a bit smaller, never taller than the panel allows
 
 
@@ -655,6 +675,11 @@ class SlipPanel:
         self.desk.bind('<Configure>', lambda e: root.after_idle(self.fit))          # window resized / different screen -> refit
         pv.tag_configure('hint', font=('Segoe UI', 16, 'bold'), foreground='#9a9a9a', justify='center')
         pv.tag_configure('slip', justify='left', foreground='#000000'); pv.tag_configure('red', foreground='#d00000')
+        pv.tag_configure('bold', font=('Courier New', -10, 'bold')); pv.tag_configure('big', font=('Courier New', -20, 'bold'))     # sizes are set again by setfont()
+
+    def setfont(self, px, width):                       # slip font + the bold / double size variants used for the totals and NET SALARY
+        self.pv.config(font=('Courier New', -px), width=width)
+        self.pv.tag_configure('bold', font=('Courier New', -px, 'bold')); self.pv.tag_configure('big', font=('Courier New', -2 * px, 'bold'))
 
     def scrollbars(self, on):
         try:
@@ -679,7 +704,7 @@ class SlipPanel:
         try:
             root.update_idletasks()
             lines = text.rstrip('\n').split('\n')
-            n, longest = len(lines), max(len(l) for l in lines)
+            n, longest = len(lines) + sum(1 for l in lines if sb.is_big(l)), max(len(l) * (2 if sb.is_big(l) else 1) for l in lines)       # the double size line counts as 2 lines / 2x width
             pv.config(height=1); root.update_idletasks()
             H, W = int(pv.winfo_height()), int(self.desk.winfo_width()) - 12
             if H < 80 or W < 80: return                                  # window not laid out yet; the <Configure> event calls us again
@@ -688,8 +713,8 @@ class SlipPanel:
                 ls, cw = _font_px(cand)
                 if ls * (n + 1) + 2 * PV_PADY + 10 <= H and cw * (longest + 1) + 2 * PV_PADX + 10 <= W: px = cand; break
             for _ in range(12):                                          # then CHECK the real widget: last line must be fully inside, otherwise one size smaller
-                pv.config(font=('Courier New', -px), width=longest + 1); root.update_idletasks()
-                bb = pv.bbox(f'{n}.0')
+                self.setfont(px, longest + 1); root.update_idletasks()
+                bb = pv.bbox(f'{len(lines)}.0')
                 try: ok = bb is not None and int(bb[1]) + int(bb[3]) <= int(pv.winfo_height()) - 2
                 except Exception: ok = True
                 if ok or px <= 4: break
@@ -700,7 +725,7 @@ class SlipPanel:
             if self.zoom != 0:
                 ls, cw = _font_px(px)
                 chars = max(10, (W - 2 * PV_PADX - 12) // max(1, cw))
-                pv.config(font=('Courier New', -px), width=min(longest + 1, chars)); root.update_idletasks()
+                self.setfont(px, min(longest + 1, chars)); root.update_idletasks()
             self.scrollbars(zoomed_in)
             self.zlbl.config(text=f'{int(round(px * 100.0 / max(1, fit_px)))}%')
             self.fit_size, self.fit_ok = px, (not zoomed_in)
@@ -720,6 +745,8 @@ class SlipPanel:
         if not hint:
             for i, ln in enumerate(text.split('\n'), 1):
                 if sb.is_red(ln): pv.tag_add('red', f'{i}.0', f'{i}.end')            # Absent / Fullday Ded. lines in red
+                if sb.is_big(ln): pv.tag_add('big', f'{i}.0', f'{i}.end')            # NET SALARY: double size, bold
+                elif sb.is_bold(ln): pv.tag_add('bold', f'{i}.0', f'{i}.end')        # totals: bold
         pv.config(state='disabled'); pv.yview_moveto(0)
         if not hint: self.fit(); root.after(200, self.fit)      # second pass once the window has finished laying out
 
@@ -765,6 +792,7 @@ def enter():
     fresh[0] = True; att.status.set(''); sal.status.set(''); printed.update(att=False, sal=False)
     if not safe_apply(): return
     show_att(uid); show_sal(uid)
+    keep_unlocked[0] = time.time() + 3; nb.select(tab_dash)       # the slips are shown on the Dashboard; the Keypad tab stays open for the next ID
 
 
 def done_print(which):                                # a slip was printed: when every slip on screen is printed, the ID and previews are cleared for the next employee
@@ -816,9 +844,9 @@ sal = SlipPanel(right, 'Salary Slip', print_salary)
 clear()
 
 
-def on_key(e):                                         # physical keyboard also works on the Dashboard tab
+def on_key(e):                                         # physical keyboard also works on the Keypad tab
     try:
-        if nb.select() != str(tab_dash) or isinstance(root.focus_get(), (tk.Entry, ttk.Entry, ttk.Combobox)): return
+        if nb.select() != str(tab_key) or isinstance(root.focus_get(), (tk.Entry, ttk.Entry, ttk.Combobox)): return
     except Exception:
         return
     if e.char and e.char.isdigit(): flash(e.char); key(e.char)
@@ -831,8 +859,8 @@ root.bind('<Key>', on_key)
 
 sb.SLIP_HOOK = lambda uid, text, state, err: dash_q.put(('punch', (uid, text, state, err)))
 
-# ---- Connectivity and Data tabs open only after typing the login password (Dashboard is always open)
-unlocked = [False]
+# ---- Keypad, Connectivity and Data tabs open only after typing the login password (Dashboard is always open)
+unlocked, keep_unlocked = [False], [0.0]
 
 
 def tab_click(e):
@@ -846,7 +874,8 @@ def tab_click(e):
 
 
 def tab_changed(e=None):
-    if nb.select() == str(tab_dash): unlocked[0] = False        # leaving the admin tabs locks them again
+    if nb.select() == str(tab_dash):
+        if time.time() > keep_unlocked[0]: unlocked[0] = False    # clicking the Dashboard tab locks Keypad / Connectivity / Data again (not right after Enter on the Keypad tab)
     elif not unlocked[0]: nb.select(tab_dash)                   # e.g. Ctrl+Tab without the password
 
 
@@ -888,6 +917,14 @@ def poll():
                 else: cur_slip[0] = text; att.show(text); att.status_lbl.config(fg='#555'); att.status.set('Printing...')
             elif state == 'ok': att.status_lbl.config(fg=INK); att.status.set('Printed')
             elif state == 'err': att.status_lbl.config(fg=RED); att.status.set('Print failed')
+            elif state == 'pshow':                              # preview-only mode: both slips are only shown, Print slip prints them
+                a_txt, s_txt = text
+                printed.update(att=False, sal=False)
+                cur_slip[0], cur_sal[0] = a_txt, s_txt
+                if a_txt: att.show(a_txt); att.status_lbl.config(fg='#555'); att.status.set('Preview only')
+                else: att.status.set(''); att.show(f'\n\n\nID {uid}\nwas not found in the reports', True)
+                if s_txt: sal.show(s_txt); sal.status_lbl.config(fg='#555'); sal.status.set('Preview only')
+                else: sal.status.set(''); sal.show(sal_hint(uid), True)
             elif state in ('sshow', 'snotfound'):               # salary punch: only the salary slip is shown / printed
                 cur_slip[0] = None; att.clear(); printed.update(att=False, sal=False)
                 if state == 'snotfound': cur_sal[0] = None; sal.status.set(''); sal.show(sal_hint(uid), True)
@@ -923,6 +960,7 @@ def poll():
 
 
 sb.SOURCE_DIR = cfg['source_dir']
+sb.PREVIEW_ONLY = bool(cfg.get('preview_only'))
 sb.start_watchers()                         # checks the reports folder and the linked folder every few seconds; a new file is live in about 15-30 s
 start_tray()
 poll()
