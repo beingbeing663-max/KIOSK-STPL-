@@ -24,6 +24,7 @@ PRINT_MODE = 'raw'                                  # 'raw' = ESC/POS thermal pr
 PRINTER_NAME = ''                                  # USB / Windows printer name; empty = use the network IP above
 SALARY_PUNCH_STATE = 4                              # punch state (the machine's function key) that prints the SALARY slip
 ATTENDANCE_PUNCH_STATES = None                      # None = every other state (3, 0, 1 ...) prints the attendance + leave balance slip; {3} = only state 3 does (others are ignored)
+PREVIEW_ONLY = False                                # True (set by the window app, password protected): a punch only shows the attendance + salary slip, nothing prints
 PRINT_RED = True                                    # Absent / Fullday Ded. lines in red: two-colour ESC/POS paper, or colour on a Windows driver (a one-colour printer just prints black). False = never send the colour command
 ID_MAP = {}                                         # only if device IDs differ: {'1': '401708'}
 
@@ -74,6 +75,19 @@ def clean_remark(text):
     return 'Fullday Ded.' if re.search(FULLDAY_DED, s) else ''
 
 
+BOLD_STARTS = ('Total Earnings', 'Total Deductions', 'Total Provident Fund')
+
+
+def is_big(line):
+    """The NET SALARY line of the salary slip: printed / shown in a double size font."""
+    return bool(re.match(r'^NET( SALARY)? ', line))
+
+
+def is_bold(line):
+    """Totals of the salary slip (bold); the big NET SALARY line is bold too."""
+    return line.startswith(BOLD_STARTS) or is_big(line)
+
+
 def is_red(line):
     """True for an attendance line of the slip whose remark is Absent or Fullday Ded. (shown / printed in red)."""
     return bool(re.match(r'^\d{2}-[A-Za-z]{3} ', line)) and line.rstrip().endswith(RED_REMARKS)
@@ -88,7 +102,7 @@ def shift_code(v):
     return str(v).strip()
 
 
-SLIP_HOOK = None   # set by the window app: SLIP_HOOK(uid, text, state, error) with state 'show' | 'ok' | 'err' | 'notfound' (attendance slip) or 'sshow' | 'sok' | 'serr' | 'snotfound' (salary slip)
+SLIP_HOOK = None   # set by the window app: SLIP_HOOK(uid, text, state, error) with state 'show' | 'ok' | 'err' | 'notfound' (attendance slip), 'sshow' | 'sok' | 'serr' | 'snotfound' (salary slip) or 'pshow' (preview mode: text = (attendance slip, salary slip))
 STOP = threading.Event()   # set by the window app to stop live()
 STATS = {'error': '', 'loading': False, 'connected': False, 'slips': 0, 'last': '-', 'printer': '-'}   # shown on the app overview
 LOADED = {}                # {'WH': file name, 'LB': file name} of the reports in use
@@ -968,7 +982,7 @@ def format_salary(rec, W=40):
 
     centre('SALARY SLIP'); centre(rec.get('company', '')); centre(rec.get('month', ''))
     line()
-    for k, lab in (('name', 'Name'), ('id', 'ID'), ('dept', 'Dept'), ('pos', 'Post'), ('grade', 'Grade'), ('type', 'Type'), ('doj', 'Joined'), ('bank', 'Bank'), ('acct', 'A/C')):
+    for k, lab in (('name', 'Name'), ('id', 'ID'), ('dept', 'Dept'), ('pos', 'Post'), ('grade', 'Grade'), ('type', 'Type'), ('doj', 'Joined'), ('bank', 'Bank')):
         if rec.get(k):
             field(lab, rec[k])
     if rec.get('gross'):
@@ -986,7 +1000,10 @@ def format_salary(rec, W=40):
         L.append('None')
     kv('Total Deductions', rec.get('td', ''))
     line()
-    kv('NET SALARY', rec.get('net', ''))
+    net = str(rec.get('net', ''))                       # double size font: half as many characters fit on the line
+    half = W // 2
+    label = 'NET SALARY' if len('NET SALARY') + 1 + len(net) <= half else 'NET'
+    L.append(label + ' ' * max(1, half - len(label) - len(net)) + net)
     line()
     tax = rec.get('tax') or {}
     if tax:
@@ -1083,15 +1100,18 @@ def gdi_print(text):
     try:
         width, height, dpi = dc.GetDeviceCaps(win32con.HORZRES), dc.GetDeviceCaps(win32con.VERTRES), dc.GetDeviceCaps(win32con.LOGPIXELSY)
         em = int(min(width / (COLS * 0.6), dpi * 9 / 72))        # 9 pt, or smaller so COLS characters fit the paper width
-        dc.SelectObject(win32ui.CreateFont({'name': 'Courier New', 'height': -em}))
+        fonts = {k: win32ui.CreateFont({'name': 'Courier New', 'height': -h, 'weight': w}) for k, h, w in (('n', em, 400), ('b', em, 700), ('big', em * 2, 700))}
         step, y = int(em * 1.25), 0
         dc.StartDoc('Attendance slip')
         dc.StartPage()
         for line in text.split('\n'):
-            if y + step > height:
+            k = 'big' if is_big(line) else 'b' if is_bold(line) else 'n'
+            h = step * 2 if k == 'big' else step
+            if y + h > height:
                 dc.EndPage(); dc.StartPage(); y = 0
+            dc.SelectObject(fonts[k])
             dc.SetTextColor(0x0000FF if PRINT_RED and is_red(line) else 0)      # COLORREF is BGR: 0x0000FF = red
-            dc.TextOut(0, y, line.rstrip()); y += step
+            dc.TextOut(0, y, line.rstrip()); y += h
         dc.EndPage()
         dc.EndDoc()
     finally:
@@ -1099,8 +1119,13 @@ def gdi_print(text):
 
 
 def print_slip(text):
-    red = lambda ln: PRINT_RED and is_red(ln)                                        # ESC r 1 = red ink, ESC r 0 = back to black
-    body = b'\n'.join(b'\x1br\x01' + ln.encode('ascii', 'replace') + b'\x1br\x00' if red(ln) else ln.encode('ascii', 'replace') for ln in text.split('\n'))
+    def raw_line(ln):
+        pre = post = b''
+        if PRINT_RED and is_red(ln): pre, post = b'\x1br\x01', b'\x1br\x00'              # ESC r 1 = red ink, ESC r 0 = back to black
+        if is_big(ln): pre, post = pre + b'\x1bE\x01\x1d!\x11', b'\x1d!\x00\x1bE\x00' + post   # bold + double width / height (GS ! 0x11)
+        elif is_bold(ln): pre, post = pre + b'\x1bE\x01', b'\x1bE\x00' + post             # ESC E 1 = bold
+        return pre + ln.encode('ascii', 'replace') + post
+    body = b'\n'.join(raw_line(ln) for ln in text.split('\n'))
     data = b'\x1b@' + body + b'\n\n\n\n\x1d\x56\x00'   # init, text, feed, cut
     if PRINTER_NAME:                                    # printer installed in Windows (USB, shared, office ...)
         import win32print
@@ -1146,6 +1171,16 @@ def live():
                 if att is None:
                     continue
                 uid = eid(ID_MAP.get(str(att.user_id), str(att.user_id)))
+                if PREVIEW_ONLY:                                          # preview mode: both slips are only shown on the dashboard; the Print slip buttons print them
+                    if time.time() - last.get((uid, 'p'), 0) < DUPLICATE_SECONDS:
+                        continue
+                    last[(uid, 'p')] = time.time()
+                    refresh()
+                    hm = att.timestamp.strftime('%H:%M')
+                    today[uid] = [today.get(uid, [hm])[0], hm]
+                    print(f'{att.timestamp} ID {uid}: preview only (nothing is printed)')
+                    _hook(uid, (slip(uid, att.timestamp), salary_text(uid)), 'pshow', '')
+                    continue
                 punch = getattr(att, 'punch', None)                      # punch state set on the machine: 0 in, 1 out, 2 break out, 3 break in, 4 OT in, 5 OT out
                 salary = punch == SALARY_PUNCH_STATE
                 if not salary and ATTENDANCE_PUNCH_STATES is not None and punch not in ATTENDANCE_PUNCH_STATES:
